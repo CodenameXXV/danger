@@ -1,10 +1,11 @@
 package ua.nebosumy
 
 import android.content.Context
+import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
-import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsSupertonicModelConfig
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import java.io.File
@@ -18,29 +19,31 @@ import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Офлайн-синтез мовлення українською через Sherpa-ONNX + модель Piper VITS
- * (український голос Lada з rhasspy/piper-voices).
+ * Офлайн-синтез мовлення українською через Sherpa-ONNX + модель Supertonic 3
+ * (10 голосів українською, 44.1 кГц; sid 0-4 — жіночі F1-F5, sid 5-9 — чоловічі M1-M5).
  *
  * Модель НЕ вшита в APK: при першому використанні вона один раз докачується
- * з офіційного релізу sherpa-onnx (туди покладено готові Piper-моделі) та
- * розпаковується у filesDir. Далі синтез працює повністю без інтернету.
+ * з офіційного релізу sherpa-onnx та розпаковується у filesDir.
+ * Далі синтез працює повністю без інтернету.
  *
- * Примітка: модель vits-piper-uk_UA-ukrainian_tts-medium НЕ використовуємо —
- * вона зламана (видає сміття; підтверджено тестом і офіційним демо k2-fsa).
+ * Примітка: Piper-моделі vits-piper-uk_UA-ukrainian_tts-medium (там теж є чоловічі
+ * голоси) — зламані в релізі k2-fsa (кривий tokens.txt, видає сміття), тому не
+ * використовуємо; перевірено тестом і коментарем мейнтейнера k2-fsa.
  */
 object Sherpa {
     const val ENGINE = "sherpa"
-    private const val MODEL_NAME = "vits-piper-uk_UA-lada-x_low"
-    private const val MODEL_FILE = "uk_UA-lada-x_low.onnx"
+    private const val MODEL_NAME = "sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
     private const val MODEL_URL =
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/$MODEL_NAME.tar.bz2"
     // контрольна сума архіву з офіційного checksum.txt релізу tts-models
     private const val MODEL_SHA256 =
-        "7a2228f249299d19016cd6ca170bf6916f8664231bcbd9e61f447b861a039cf5"
-    // точний розмір uk_UA-lada-x_low.onnx всередині архіву (fp32)
-    private const val MODEL_ONNX_SIZE = 20576273L
-    // сумарний розмір усіх файлів архіву після розпакування (~39 МБ, 359 файлів)
-    private const val MODEL_TOTAL_SIZE = 38573140L
+        "82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427"
+    // сумарний розмір усіх файлів архіву після розпакування (~139 МБ, 9 файлів)
+    private const val MODEL_TOTAL_SIZE = 145316356L
+    // 10 голосів: sid 0-4 жіночі (F1-F5), sid 5-9 чоловічі (M1-M5) — обрано чоловічий M1
+    private const val VOICE_SID = 5
+    private const val NUM_STEPS = 8
+    private const val LANG = "uk"
     private const val SPEED = 1.0f
     private const val NUM_THREADS = 2
 
@@ -56,14 +59,22 @@ object Sherpa {
 
     private fun dir(c: Context): File = File(c.filesDir, "sherpa/$MODEL_NAME")
 
-    fun ready(c: Context): Boolean =
-        File(dir(c), MODEL_FILE).isFile && File(dir(c), "tokens.txt").isFile &&
-            File(dir(c), "espeak-ng-data").isDirectory
+    fun ready(c: Context): Boolean = FILE_NAMES.all { File(dir(c), it).isFile }
+
+    private val FILE_NAMES = arrayOf(
+        "duration_predictor.int8.onnx",
+        "text_encoder.int8.onnx",
+        "vector_estimator.int8.onnx",
+        "vocoder.int8.onnx",
+        "tts.json",
+        "unicode_indexer.bin",
+        "voice.bin",
+    )
 
     fun statusText(c: Context): String = when {
         ready(c) -> "Модель готова (офлайн)"
         busy.get() -> status ?: "Завантаження моделі…"
-        else -> "Модель не завантажена (~25 МБ, завантажиться при першому використанні)"
+        else -> "Модель не завантажена (~123 МБ, завантажиться при першому використанні)"
     }
 
     /**
@@ -83,7 +94,13 @@ object Sherpa {
             ensure(c)
             tts(c)
         }
-        val audio = t.generate(text, sid = 0, speed = SPEED)
+        val gen = GenerationConfig(
+            speed = SPEED,
+            sid = VOICE_SID,
+            numSteps = NUM_STEPS,
+            extra = mapOf("lang" to LANG),
+        )
+        val audio = t.generateWithConfig(text, gen)
         if (audio.samples.isEmpty()) throw RuntimeException("порожнє аудіо")
         writeWav(out, audio.samples, audio.sampleRate)
     }
@@ -112,11 +129,14 @@ object Sherpa {
         if (!ready(c)) throw RuntimeException("офлайн-модель не завантажена")
         val cfg = OfflineTtsConfig(
             model = OfflineTtsModelConfig(
-                vits = OfflineTtsVitsModelConfig(
-                    model = File(d, MODEL_FILE).absolutePath,
-                    tokens = File(d, "tokens.txt").absolutePath,
-                    // espeak-ng-data потрібен Piper-моделям для фонемізації тексту
-                    dataDir = File(d, "espeak-ng-data").absolutePath,
+                supertonic = OfflineTtsSupertonicModelConfig(
+                    durationPredictor = File(d, "duration_predictor.int8.onnx").absolutePath,
+                    textEncoder = File(d, "text_encoder.int8.onnx").absolutePath,
+                    vectorEstimator = File(d, "vector_estimator.int8.onnx").absolutePath,
+                    vocoder = File(d, "vocoder.int8.onnx").absolutePath,
+                    ttsJson = File(d, "tts.json").absolutePath,
+                    unicodeIndexer = File(d, "unicode_indexer.bin").absolutePath,
+                    voiceStyle = File(d, "voice.bin").absolutePath,
                 ),
                 numThreads = NUM_THREADS,
                 debug = false,
@@ -144,7 +164,7 @@ object Sherpa {
         // стираємо весь каталог sherpa: прибирає і старі/побиті моделі
         File(c.filesDir, "sherpa").deleteRecursively()
         val d = dir(c)
-        val tmp = File(c.cacheDir, "$MODEL_NAME.tar.bz2")
+        val tmp = File(c.cacheDir, "supertonic3.tar.bz2")
         busy.set(true)
         try {
             set("Завантаження моделі 0%…")
@@ -195,9 +215,6 @@ object Sherpa {
             set("Розпакування моделі 0%…")
             extract(tmp, d)
             if (!ready(c)) throw RuntimeException("архів моделі пошкоджений")
-            if (File(d, MODEL_FILE).length() != MODEL_ONNX_SIZE) {
-                throw RuntimeException("файл моделі несподіваного розміру")
-            }
         } finally {
             busy.set(false)
             tmp.delete()
@@ -226,7 +243,7 @@ object Sherpa {
             while (true) {
                 val e = t.nextTarEntry ?: break
                 if (!t.canReadEntryData(e)) continue
-                // прибираємо кореневу папку архіву vits-piper-…/
+                // прибираємо кореневу папку архіву sherpa-onnx-supertonic-…/
                 val rel = e.name.dropWhile { it == '/' }
                     .substringAfter('/', "")
                 if (rel.isEmpty()) continue
