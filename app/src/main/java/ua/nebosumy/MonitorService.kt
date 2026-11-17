@@ -12,15 +12,17 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
-import android.text.Html
-import java.net.HttpURLConnection
-import java.net.URL
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 object Bus {
@@ -35,20 +37,40 @@ object Bus {
     }
 }
 
-private data class Msg(val id: Int, val text: String, val audio: String?)
-
 class MonitorService : Service() {
 
     @Volatile private var active = false
+    @Volatile private var ttsReady = false
     private var worker: Thread? = null
     private var wake: PowerManager.WakeLock? = null
+    private var tts: TextToSpeech? = null
+
+    private val urlRe = Regex("https?://\\S+|t\\.me/\\S+")
+    private val emojiRe = Regex("[\\p{So}\\p{Sk}\\u200D\\uFE0F\\u20E3\\uFFFC]")
+    private val spaceRe = Regex("\\s+")
+
+    private val attrs = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+        .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onCreate() {
+        super.onCreate()
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                val r = tts?.setLanguage(Locale("uk", "UA"))
+                ttsReady = r != null && r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
+                tts?.setAudioAttributes(attrs)
+            }
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val n = notification()
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(1, n)
         }
@@ -67,6 +89,8 @@ class MonitorService : Service() {
         Bus.running = false
         worker?.interrupt()
         wake?.let { if (it.isHeld) it.release() }
+        tts?.stop()
+        tts?.shutdown()
         Bus.post("Зупинено")
         super.onDestroy()
     }
@@ -77,44 +101,66 @@ class MonitorService : Service() {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, "mon")
             .setContentTitle("Небо Сумщини")
-            .setContentText("Слухаю канал")
+            .setContentText("Моніторинг активний")
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
     }
 
-    private fun interval(): Long =
-        getSharedPreferences("s", MODE_PRIVATE).getInt("interval", 2) * 1000L
+    private fun prefs() = getSharedPreferences("s", MODE_PRIVATE)
 
     private fun loop() {
-        var lastVoice = -1
+        val seen = HashMap<String, Int>()
+        val pool = Executors.newFixedThreadPool(4)
         try {
             while (active) {
-                var wait = interval()
+                var wait = prefs().getInt("interval", 2) * 1000L
                 try {
-                    val msgs = fetch()
-                    val voices = msgs.filter { it.audio != null }.sortedBy { it.id }
-                    if (lastVoice < 0) lastVoice = voices.lastOrNull()?.id ?: 0
-
-                    if (Bus.playLast) {
-                        Bus.playLast = false
-                        voices.lastOrNull()?.let {
-                            Bus.post(summary(msgs, "▶ останнє голосове #${it.id}"))
-                            play(it.audio!!)
-                            lastVoice = maxOf(lastVoice, it.id)
+                    val names = Store.channels(this).filter { it.second }.map { it.first }
+                    seen.keys.retainAll(names.toSet())
+                    if (names.isEmpty()) {
+                        Bus.post("Немає активних каналів. Додайте канал і увімкніть його.")
+                    } else {
+                        val futures = names.map { n -> n to pool.submit(Callable { Telegram.fetch(n) }) }
+                        val results = LinkedHashMap<String, List<Msg>>()
+                        val errors = ArrayList<String>()
+                        for ((n, f) in futures) {
+                            try {
+                                results[n] = f.get().sortedBy { it.id }
+                            } catch (e: InterruptedException) {
+                                throw e
+                            } catch (e: Exception) {
+                                errors.add("@$n: ${e.cause?.message ?: e.message}")
+                            }
                         }
-                    }
+                        if (results.isEmpty()) wait = 5000
 
-                    for (m in voices.filter { it.id > lastVoice }) {
-                        if (!active) break
-                        lastVoice = m.id
-                        Bus.post(summary(msgs, "▶ нове голосове #${m.id}"))
-                        play(m.audio!!)
-                    }
+                        if (Bus.playLast) {
+                            Bus.playLast = false
+                            for ((n, msgs) in results) {
+                                msgs.lastOrNull()?.let {
+                                    Bus.post(summary(results, errors, "▶ останнє: @$n #${it.id}"))
+                                    handle(it)
+                                }
+                            }
+                        }
 
-                    val t = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                    Bus.post(summary(msgs, "Слухаю канал, оновлено $t"))
+                        for ((n, msgs) in results) {
+                            val max = msgs.lastOrNull()?.id ?: 0
+                            val prev = seen[n]
+                            seen[n] = maxOf(prev ?: 0, max)
+                            if (prev == null) continue
+                            for (m in msgs.filter { it.id > prev }) {
+                                if (!active) break
+                                Bus.post(summary(results, errors, "▶ нове: @$n #${m.id}"))
+                                handle(m)
+                            }
+                        }
+
+                        val t = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                        Bus.post(summary(results, errors, "Моніторинг активний, оновлено $t"))
+                    }
                 } catch (e: InterruptedException) {
                     throw e
                 } catch (e: Exception) {
@@ -128,79 +174,98 @@ class MonitorService : Service() {
                 }
             }
         } catch (e: InterruptedException) {
+        } finally {
+            pool.shutdownNow()
         }
     }
 
-    private fun summary(msgs: List<Msg>, head: String): String {
-        val tail = msgs.sortedBy { it.id }.takeLast(8).reversed().joinToString("\n\n") {
-            if (it.audio != null) {
-                "#${it.id} 🔊 голосове" + if (it.text.isNotEmpty()) ": ${it.text}" else ""
-            } else {
-                "#${it.id} ${it.text}"
+    private fun summary(results: Map<String, List<Msg>>, errors: List<String>, head: String): String {
+        val sb = StringBuilder(head)
+        if (!ttsReady && prefs().getBoolean("tts", true)) {
+            sb.append("\n⚠ Немає українського голосу для озвучення тексту")
+        }
+        for (e in errors) sb.append("\n⚠ ").append(e)
+        for ((n, msgs) in results) {
+            sb.append("\n\n@").append(n)
+            for (m in msgs.takeLast(3).reversed()) {
+                sb.append("\n#").append(m.id).append(' ')
+                if (m.audio != null) sb.append("🔊 ")
+                sb.append(m.text.take(200))
             }
         }
-        return head + "\n\n" + tail
+        return sb.toString()
     }
 
-    private fun fetch(): List<Msg> {
-        val c = URL("https://t.me/s/NeboSumyOperatyvno").openConnection() as HttpURLConnection
-        c.connectTimeout = 8000
-        c.readTimeout = 8000
-        c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
-        c.setRequestProperty("Cache-Control", "no-cache")
-        try {
-            if (c.responseCode != 200) throw RuntimeException("HTTP ${c.responseCode}")
-            return parse(c.inputStream.bufferedReader().readText())
-        } finally {
-            c.disconnect()
+    private fun handle(m: Msg) {
+        val audio = m.audio
+        if (audio != null) {
+            play(audio)
+            return
         }
+        if (!prefs().getBoolean("tts", true)) return
+        val clean = m.text.replace(urlRe, " ").replace(emojiRe, "").replace(spaceRe, " ").trim()
+        if (clean.isEmpty()) return
+        val words = clean.split(" ").size
+        if (words > prefs().getInt("maxwords", 40)) return
+        speak(clean)
     }
 
-    private fun parse(html: String): List<Msg> {
-        val marks = Regex("data-post=\"[^\"/]+/(\\d+)\"").findAll(html).toList()
-        val audioRe = Regex("<audio[^>]*\\ssrc=\"([^\"]+)\"")
-        val textRe = Regex("js-message_text[^>]*>(.*?)</div>", RegexOption.DOT_MATCHES_ALL)
-        val out = ArrayList<Msg>()
-        for (i in marks.indices) {
-            val start = marks[i].range.first
-            val end = if (i + 1 < marks.size) marks[i + 1].range.first else html.length
-            val chunk = html.substring(start, end)
-            val audio = audioRe.find(chunk)?.groupValues?.get(1)?.replace("&amp;", "&")
-            val raw = textRe.find(chunk)?.groupValues?.get(1) ?: ""
-            val text = Html.fromHtml(raw, Html.FROM_HTML_MODE_LEGACY).toString().trim()
-            out.add(Msg(marks[i].groupValues[1].toInt(), text, audio))
-        }
-        return out.distinctBy { it.id }
-    }
-
-    private fun play(url: String) {
+    private fun withFocus(block: () -> Unit) {
         val am = getSystemService(AUDIO_SERVICE) as AudioManager
-        val attrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
         val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
             .setAudioAttributes(attrs)
             .build()
         am.requestAudioFocus(req)
-        val latch = CountDownLatch(1)
-        val mp = MediaPlayer()
         try {
-            mp.setAudioAttributes(attrs)
-            mp.setDataSource(url)
-            val v = getSharedPreferences("s", MODE_PRIVATE).getInt("volume", 100) / 100f
-            mp.setVolume(v, v)
-            mp.setOnPreparedListener { it.start() }
-            mp.setOnCompletionListener { latch.countDown() }
-            mp.setOnErrorListener { _, _, _ ->
-                latch.countDown()
-                true
-            }
-            mp.prepareAsync()
-            latch.await(120, TimeUnit.SECONDS)
+            block()
         } finally {
-            mp.release()
             am.abandonAudioFocusRequest(req)
+        }
+    }
+
+    private fun volume(): Float = prefs().getInt("volume", 100) / 100f
+
+    private fun play(url: String) {
+        withFocus {
+            val latch = CountDownLatch(1)
+            val mp = MediaPlayer()
+            try {
+                mp.setAudioAttributes(attrs)
+                mp.setDataSource(url)
+                val v = volume()
+                mp.setVolume(v, v)
+                mp.setOnPreparedListener { it.start() }
+                mp.setOnCompletionListener { latch.countDown() }
+                mp.setOnErrorListener { _, _, _ ->
+                    latch.countDown()
+                    true
+                }
+                mp.prepareAsync()
+                latch.await(120, TimeUnit.SECONDS)
+            } finally {
+                mp.release()
+            }
+        }
+    }
+
+    private fun speak(text: String) {
+        val t = tts ?: return
+        if (!ttsReady) return
+        withFocus {
+            val latch = CountDownLatch(1)
+            t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) {
+                    latch.countDown()
+                }
+                override fun onError(utteranceId: String?) {
+                    latch.countDown()
+                }
+            })
+            val params = Bundle()
+            params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume())
+            t.speak(text, TextToSpeech.QUEUE_FLUSH, params, "u" + System.nanoTime())
+            latch.await(90, TimeUnit.SECONDS)
         }
     }
 }
