@@ -14,22 +14,33 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Офлайн-синтез мовлення українською через Sherpa-ONNX + модель Piper VITS
- * (голос проєкту robinhad/ukrainian-tts, конвертований для Piper).
+ * (український голос Lada з rhasspy/piper-voices).
  *
  * Модель НЕ вшита в APK: при першому використанні вона один раз докачується
  * з офіційного релізу sherpa-onnx (туди покладено готові Piper-моделі) та
  * розпаковується у filesDir. Далі синтез працює повністю без інтернету.
+ *
+ * Примітка: модель vits-piper-uk_UA-ukrainian_tts-medium НЕ використовуємо —
+ * вона зламана (видає сміття; підтверджено тестом і офіційним демо k2-fsa).
  */
 object Sherpa {
     const val ENGINE = "sherpa"
-    private const val MODEL_NAME = "vits-piper-uk_UA-ukrainian_tts-medium-int8"
-    private const val MODEL_FILE = "uk_UA-ukrainian_tts-medium.onnx"
+    private const val MODEL_NAME = "vits-piper-uk_UA-lada-x_low"
+    private const val MODEL_FILE = "uk_UA-lada-x_low.onnx"
     private const val MODEL_URL =
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/$MODEL_NAME.tar.bz2"
+    // контрольна сума архіву з офіційного checksum.txt релізу tts-models
+    private const val MODEL_SHA256 =
+        "7a2228f249299d19016cd6ca170bf6916f8664231bcbd9e61f447b861a039cf5"
+    // точний розмір uk_UA-lada-x_low.onnx всередині архіву (fp32)
+    private const val MODEL_ONNX_SIZE = 20576273L
+    // сумарний розмір усіх файлів архіву після розпакування (~39 МБ, 359 файлів)
+    private const val MODEL_TOTAL_SIZE = 38573140L
     private const val SPEED = 1.0f
     private const val NUM_THREADS = 2
 
@@ -52,16 +63,26 @@ object Sherpa {
     fun statusText(c: Context): String = when {
         ready(c) -> "Модель готова (офлайн)"
         busy.get() -> status ?: "Завантаження моделі…"
-        else -> "Модель не завантажена (~22 МБ, завантажиться при першому використанні)"
+        else -> "Модель не завантажена (~25 МБ, завантажиться при першому використанні)"
     }
 
     /**
      * Синтез тексту -> WAV-файл. Якщо моделі немає — синхронно докачує її
      * (викликати лише з фонового потоку, наприклад з "Перевірити голос").
+     * Якщо модель на диску побита (обірване завантаження) — сам її перекачає.
      */
     fun speak(c: Context, text: String, out: File) {
         ensure(c)
-        val t = tts(c)
+        val t = try {
+            tts(c)
+        } catch (e: Exception) {
+            if (!ready(c)) throw e
+            // модель є, але завантажується з помилкою — стираємо і качаємо заново
+            release()
+            dir(c).deleteRecursively()
+            ensure(c)
+            tts(c)
+        }
         val audio = t.generate(text, sid = 0, speed = SPEED)
         if (audio.samples.isEmpty()) throw RuntimeException("порожнє аудіо")
         writeWav(out, audio.samples, audio.sampleRate)
@@ -120,8 +141,9 @@ object Sherpa {
     @Synchronized
     private fun download(c: Context) {
         if (ready(c)) return
+        // стираємо весь каталог sherpa: прибирає і старі/побиті моделі
+        File(c.filesDir, "sherpa").deleteRecursively()
         val d = dir(c)
-        d.deleteRecursively()
         val tmp = File(c.cacheDir, "$MODEL_NAME.tar.bz2")
         busy.set(true)
         try {
@@ -153,13 +175,31 @@ object Sherpa {
                         }
                     }
                 }
+                // архів має бути докачаний до кінця
+                if (total > 0 && done != total) {
+                    throw RuntimeException(
+                        "архів докачався не повністю ($done з $total байтів)"
+                    )
+                }
             } finally {
                 conn.disconnect()
             }
 
-            set("Розпакування моделі…")
+            // перевірка цілісності завантаженого архіву
+            set("Перевірка цілісності…")
+            val got = sha256(tmp)
+            if (!got.equals(MODEL_SHA256, ignoreCase = true)) {
+                throw RuntimeException(
+                    "архів пошкоджено при завантаженні (сума не збігається) — спробуйте ще раз"
+                )
+            }
+
+            set("Розпакування моделі 0%…")
             extract(tmp, d)
             if (!ready(c)) throw RuntimeException("архів моделі пошкоджений")
+            if (File(d, MODEL_FILE).length() != MODEL_ONNX_SIZE) {
+                throw RuntimeException("файл моделі несподіваного розміру")
+            }
         } finally {
             busy.set(false)
             tmp.delete()
@@ -167,9 +207,24 @@ object Sherpa {
         }
     }
 
+    private fun sha256(f: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        FileInputStream(f).use { i ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = i.read(buf)
+                if (n < 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private fun extract(archive: File, target: File) {
         target.mkdirs()
         TarArchiveInputStream(BZip2CompressorInputStream(FileInputStream(archive))).use { t ->
+            var done = 0L
+            var last = -1L
             while (true) {
                 val e = t.nextTarEntry ?: break
                 if (!t.canReadEntryData(e)) continue
@@ -183,8 +238,18 @@ object Sherpa {
                     f.mkdirs()
                 } else {
                     f.parentFile?.mkdirs()
-                    FileOutputStream(f).use { o -> t.copyTo(o) }
+                    FileOutputStream(f).use { o -> t.copyTo(o, 64 * 1024) }
+                    done += e.size
+                    // прогрес: розпакування на флеш-пам'ять тривале, треба бачити рух
+                    val p = (done * 100 / MODEL_TOTAL_SIZE).coerceIn(0, 100)
+                    if (p != last) {
+                        last = p
+                        set("Розпакування моделі $p%…")
+                    }
                 }
+            }
+            if (done != MODEL_TOTAL_SIZE) {
+                throw RuntimeException("архів моделі розпаковано не повністю")
             }
         }
     }
