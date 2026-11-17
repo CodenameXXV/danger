@@ -20,19 +20,18 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
-class DailyQuotaException(msg: String) : RuntimeException(msg)
-
 object Voice {
     const val DEFAULT_MODEL = "gemini-2.5-flash-preview-tts"
     const val DEFAULT_VOICE = "Kore"
     const val ENGINE_SYSTEM = "system"
     const val ENGINE_GOOGLE = "google"
     const val ENGINE_GEMINI = "gemini"
+    const val ENGINE_SHERPA = Sherpa.ENGINE
     private val rateRe = Regex("rate=(\\d+)")
 
     fun engine(c: Context): String =
         when (val e = c.getSharedPreferences("s", Context.MODE_PRIVATE).getString("engine", ENGINE_GEMINI)) {
-            ENGINE_SYSTEM, ENGINE_GOOGLE -> e
+            ENGINE_SYSTEM, ENGINE_GOOGLE, ENGINE_SHERPA -> e
             else -> ENGINE_GEMINI
         }
 
@@ -140,9 +139,6 @@ object Voice {
                     JSONObject(raw).getJSONObject("error").getString("message")
                 } catch (e: Exception) {
                     raw
-                }
-                if (code == 429 && raw.contains("PerDay", true)) {
-                    throw DailyQuotaException("HTTP 429: добовий ліміт Gemini вичерпано")
                 }
                 throw RuntimeException("HTTP $code: ${msg.take(200)}")
             }

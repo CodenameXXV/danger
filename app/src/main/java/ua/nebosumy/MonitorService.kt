@@ -40,7 +40,6 @@ class MonitorService : Service() {
     @Volatile private var active = false
     @Volatile private var ttsErr: String? = null
     @Volatile private var geminiPause = 0L
-    @Volatile private var pausedKey = ""
     private var worker: Thread? = null
     private var wake: PowerManager.WakeLock? = null
 
@@ -78,6 +77,7 @@ class MonitorService : Service() {
         Bus.running = false
         worker?.interrupt()
         wake?.let { if (it.isHeld) it.release() }
+        Sherpa.release()
         Bus.post("Зупинено")
         super.onDestroy()
     }
@@ -245,12 +245,10 @@ class MonitorService : Service() {
     }
 
     private fun tryGemini(text: String): File? {
-        val key = prefs().getString("gkey", "").orEmpty().trim()
-        if (key.isEmpty()) {
+        if (prefs().getString("gkey", "").orEmpty().isBlank()) {
             ttsErr = null
             return null
         }
-        if (key != pausedKey) geminiPause = 0L
         if (System.currentTimeMillis() < geminiPause) return null
         val f = File(cacheDir, "tts_" + System.nanoTime() + ".wav")
         try {
@@ -263,30 +261,10 @@ class MonitorService : Service() {
         } catch (e: Exception) {
             f.delete()
             val m = e.message ?: e.javaClass.simpleName
-            if (e is DailyQuotaException) {
-                geminiPause = nextQuotaReset()
-                pausedKey = key
-                val t = SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()).format(Date(geminiPause))
-                ttsErr = "Gemini: добовий ліміт вичерпано. Голос Google Translate до $t"
-            } else {
-                if (m.contains("429")) {
-                    geminiPause = System.currentTimeMillis() + 60000
-                    pausedKey = key
-                }
-                ttsErr = "Gemini: $m (використано запасний голос)"
-            }
+            if (m.contains("429")) geminiPause = System.currentTimeMillis() + 60000
+            ttsErr = "Gemini: $m (використано запасний голос)"
             return null
         }
-    }
-
-    /** Добова квота Gemini скидається опівночі за тихоокеанським часом. */
-    private fun nextQuotaReset(): Long {
-        val c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("America/Los_Angeles"))
-        c.add(java.util.Calendar.DAY_OF_MONTH, 1)
-        c.set(java.util.Calendar.HOUR_OF_DAY, 0)
-        c.set(java.util.Calendar.MINUTE, 5)
-        c.set(java.util.Calendar.SECOND, 0)
-        return c.timeInMillis
     }
 
     private fun trySystem(text: String): File? {
@@ -305,6 +283,29 @@ class MonitorService : Service() {
         }
     }
 
+    private fun trySherpa(text: String): File? {
+        if (!Sherpa.ready(this)) {
+            // модель ще не докачана: запускаємо фонове завантаження,
+            // а заразом озвучуємо запасним голосом
+            Sherpa.ensureAsync(this)
+            ttsErr = "Офлайн-модель завантажується (використано запасний голос)"
+            return null
+        }
+        val f = File(cacheDir, "tts_" + System.nanoTime() + ".wav")
+        try {
+            Sherpa.speak(this, text, f)
+            ttsErr = null
+            return f
+        } catch (e: InterruptedException) {
+            f.delete()
+            throw e
+        } catch (e: Exception) {
+            f.delete()
+            ttsErr = "Офлайн голос: ${e.message ?: e.javaClass.simpleName} (використано запасний голос)"
+            return null
+        }
+    }
+
     private fun speak(text: String) {
         try {
             val g = when (Voice.engine(this)) {
@@ -313,6 +314,7 @@ class MonitorService : Service() {
                     ttsErr = null
                     null
                 }
+                Voice.ENGINE_SHERPA -> trySherpa(text)
                 else -> tryGemini(text)
             }
             if (g != null) {

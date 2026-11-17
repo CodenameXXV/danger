@@ -545,16 +545,19 @@ class MainActivity : Activity() {
         val engineHint = tv("", 12f, col(R.color.muted))
         engineHint.setPadding(dp(2), dp(6), 0, 0)
         val geminiBox = vbox()
+        val sherpaBox = vbox()
 
         val engines = listOf(
             Voice.ENGINE_SYSTEM to "Вбудований голос телефону",
             Voice.ENGINE_GOOGLE to "Google Translate",
-            Voice.ENGINE_GEMINI to "Gemini"
+            Voice.ENGINE_GEMINI to "Gemini",
+            Voice.ENGINE_SHERPA to "Офлайн голос (Sherpa-ONNX)"
         )
         val hints = mapOf(
             Voice.ENGINE_SYSTEM to "Голос із налаштувань телефону (Google TTS, Samsung тощо). Потрібна встановлена українська мова. Якщо її немає, використовується голос Google Translate.",
             Voice.ENGINE_GOOGLE to "Безкоштовний голос Google Translate. Ключ не потрібен.",
-            Voice.ENGINE_GEMINI to "Найприродніший голос. Потрібен ключ Gemini API. Без ключа або при вичерпанні ліміту використовується голос Google Translate."
+            Voice.ENGINE_GEMINI to "Найприродніший голос. Потрібен ключ Gemini API. Без ключа або при вичерпанні ліміту використовується голос Google Translate.",
+            Voice.ENGINE_SHERPA to "Повністю офлайн-синтез українською (Piper VITS, голос проєкту ukrainian-tts). Модель ~22 МБ докачується один раз при першому використанні, далі працює без інтернету."
         )
         val cur = Voice.engine(this)
         val group = RadioGroup(this)
@@ -574,6 +577,7 @@ class MainActivity : Activity() {
         fun applyEngine(k: String) {
             engineHint.text = hints[k]
             geminiBox.visibility = if (k == Voice.ENGINE_GEMINI) View.VISIBLE else View.GONE
+            sherpaBox.visibility = if (k == Voice.ENGINE_SHERPA) View.VISIBLE else View.GONE
         }
         applyEngine(cur)
         group.setOnCheckedChangeListener { g, id ->
@@ -583,6 +587,56 @@ class MainActivity : Activity() {
         }
         c3.addView(group)
         c3.addView(engineHint)
+
+        val sherpaStatus = tv(Sherpa.statusText(this), 12f, col(R.color.muted))
+        sherpaStatus.setPadding(dp(2), dp(10), 0, 0)
+        val sherpaBtn = btn("Завантажити офлайн-модель", col(R.color.accent_soft), col(R.color.accent)) {}
+        sherpaBtn.setOnClickListener {
+            if (Sherpa.ready(this)) {
+                toast("Модель уже завантажена")
+                return@setOnClickListener
+            }
+            sherpaBtn.isEnabled = false
+            sherpaBtn.alpha = 0.5f
+            toast("Завантажую модель…")
+            Thread {
+                try {
+                    val f = File(cacheDir, "warmup.wav")
+                    Sherpa.speak(this, "Модель завантажено.", f)
+                    f.delete()
+                    ui.post { toast("Офлайн-модель готова") }
+                } catch (e: Exception) {
+                    ui.post {
+                        if (!isFinishing) {
+                            AlertDialog.Builder(this)
+                                .setTitle("Помилка завантаження моделі")
+                                .setMessage(e.message ?: e.javaClass.simpleName)
+                                .setPositiveButton("OK", null)
+                                .show()
+                        }
+                    }
+                }
+                ui.post {
+                    sherpaBtn.isEnabled = true
+                    sherpaBtn.alpha = 1f
+                    sherpaStatus.text = Sherpa.statusText(this)
+                }
+            }.start()
+        }
+        val sp = lp(-1, -2)
+        sp.topMargin = dp(10)
+        sherpaBox.addView(sherpaStatus)
+        sherpaBox.addView(sherpaBtn, sp)
+        Sherpa.onStatus = { s ->
+            ui.post {
+                sherpaStatus.text = s ?: Sherpa.statusText(this)
+                if (s == null && !sherpaBtn.isEnabled) {
+                    sherpaBtn.isEnabled = true
+                    sherpaBtn.alpha = 1f
+                }
+            }
+        }
+        c3.addView(sherpaBox)
 
         val how = tv("Як отримати ключ", 15f, col(R.color.text), true)
         how.setPadding(0, dp(14), 0, dp(4))
@@ -713,6 +767,7 @@ class MainActivity : Activity() {
                 when (engine) {
                     Voice.ENGINE_SYSTEM -> Voice.system(this, text, f)
                     Voice.ENGINE_GOOGLE -> Voice.translate(text, f)
+                    Voice.ENGINE_SHERPA -> Sherpa.speak(this, text, f)
                     else -> Voice.gemini(this, text, f)
                 }
                 null
@@ -727,6 +782,7 @@ class MainActivity : Activity() {
                             when (engine) {
                                 Voice.ENGINE_SYSTEM -> "Помилка вбудованого голосу"
                                 Voice.ENGINE_GOOGLE -> "Помилка Google Translate"
+                                Voice.ENGINE_SHERPA -> "Помилка офлайн голосу"
                                 else -> "Помилка Gemini"
                             }
                         )
