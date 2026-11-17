@@ -9,6 +9,7 @@ plugins {
 // ── Sherpa-ONNX Android AAR ──────────────────────────────────────────────────
 // AAR (~48 МБ) не зберігається в репозиторії: при першій збірці Gradle сам
 // завантажує його з офіційного релізу k2-fsa/sherpa-onnx у папку app/libs/.
+// Спеціально БЕЗ outputs/onlyIf — щоб не спотикатись про валідацію виходів.
 val sherpaVersion = "1.13.8"
 val sherpaAar = file("libs/sherpa-onnx-$sherpaVersion.aar")
 val sherpaAarUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$sherpaVersion/sherpa-onnx-$sherpaVersion.aar"
@@ -16,32 +17,46 @@ val sherpaAarUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$sh
 tasks.register("downloadSherpaAar") {
     group = "setup"
     description = "Завантажує sherpa-onnx-$sherpaVersion.aar в app/libs/, якщо файла там немає"
-    outputs.file(sherpaAar)
-    onlyIf { !sherpaAar.exists() }
     doLast {
-        sherpaAar.parentFile.mkdirs()
+        if (sherpaAar.isFile) {
+            println("sherpa-onnx AAR уже на місці: ${sherpaAar.absolutePath}")
+            return@doLast
+        }
+        // нестандартний стан (наприклад, замість файла лежить папка) — прибираємо
+        if (sherpaAar.exists()) sherpaAar.deleteRecursively()
+        // якщо app/libs існує як ФАЙЛ (сторонній предмет з репозиторію) — прибираємо
+        val parent = sherpaAar.parentFile
+        if (parent.exists() && !parent.isDirectory) parent.delete()
+        parent.mkdirs()
         val tmp = File(sherpaAar.parentFile, sherpaAar.name + ".part")
         println("Завантаження $sherpaAarUrl …")
-        val conn = URL(sherpaAarUrl).openConnection() as HttpURLConnection
-        conn.connectTimeout = 30000
-        conn.readTimeout = 120000
         try {
-            if (conn.responseCode != 200) {
-                throw GradleException("Не вдалося завантажити $sherpaAarUrl (HTTP ${conn.responseCode})")
+            val conn = URL(sherpaAarUrl).openConnection() as HttpURLConnection
+            conn.connectTimeout = 30000
+            conn.readTimeout = 120000
+            try {
+                if (conn.responseCode != 200) {
+                    throw GradleException("Не вдалося завантажити $sherpaAarUrl (HTTP ${conn.responseCode})")
+                }
+                conn.inputStream.use { input ->
+                    tmp.outputStream().use { output -> input.copyTo(output) }
+                }
+            } finally {
+                conn.disconnect()
             }
-            conn.inputStream.use { input ->
-                tmp.outputStream().use { output -> input.copyTo(output) }
+            if (tmp.length() < 1_000_000L) {
+                throw GradleException("Завантажений файл підозріло малий — перевірте інтернет")
             }
+            if (!tmp.renameTo(sherpaAar)) {
+                sherpaAar.delete()
+                if (!tmp.renameTo(sherpaAar)) {
+                    tmp.copyTo(sherpaAar, overwrite = true)
+                    tmp.delete()
+                }
+            }
+            println("Готово: ${sherpaAar.absolutePath} (${sherpaAar.length() / 1_000_000} МБ)")
         } finally {
-            conn.disconnect()
-        }
-        if (tmp.length() < 1_000_000L) {
             tmp.delete()
-            throw GradleException("Завантажений файл підозріло малий — перевірте інтернет")
-        }
-        if (!tmp.renameTo(sherpaAar)) {
-            sherpaAar.delete()
-            tmp.renameTo(sherpaAar)
         }
     }
 }
