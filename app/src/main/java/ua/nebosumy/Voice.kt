@@ -20,6 +20,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
+class DailyQuotaException(msg: String) : RuntimeException(msg)
+
 object Voice {
     const val DEFAULT_MODEL = "gemini-2.5-flash-preview-tts"
     const val DEFAULT_VOICE = "Kore"
@@ -138,6 +140,9 @@ object Voice {
                     JSONObject(raw).getJSONObject("error").getString("message")
                 } catch (e: Exception) {
                     raw
+                }
+                if (code == 429 && raw.contains("PerDay", true)) {
+                    throw DailyQuotaException("HTTP 429: добовий ліміт Gemini вичерпано")
                 }
                 throw RuntimeException("HTTP $code: ${msg.take(200)}")
             }
