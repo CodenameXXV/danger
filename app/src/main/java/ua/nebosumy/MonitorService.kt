@@ -12,11 +12,12 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
-import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -40,14 +41,14 @@ object Bus {
 class MonitorService : Service() {
 
     @Volatile private var active = false
-    @Volatile private var ttsReady = false
+    @Volatile private var ttsErr: String? = null
     private var worker: Thread? = null
     private var wake: PowerManager.WakeLock? = null
-    private var tts: TextToSpeech? = null
 
     private val urlRe = Regex("https?://\\S+|t\\.me/\\S+")
     private val emojiRe = Regex("[\\p{So}\\p{Sk}\\u200D\\uFE0F\\u20E3\\uFFFC]")
     private val spaceRe = Regex("\\s+")
+    private val sentenceRe = Regex("(?<=[.!?…])\\s+")
 
     private val attrs = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -55,17 +56,6 @@ class MonitorService : Service() {
         .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onCreate() {
-        super.onCreate()
-        tts = TextToSpeech(this) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                val r = tts?.setLanguage(Locale("uk", "UA"))
-                ttsReady = r != null && r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
-                tts?.setAudioAttributes(attrs)
-            }
-        }
-    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val n = notification()
@@ -78,7 +68,7 @@ class MonitorService : Service() {
             active = true
             Bus.running = true
             val pm = getSystemService(POWER_SERVICE) as PowerManager
-            wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nebosumy:monitor").apply { acquire() }
+            wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "monitor:work").apply { acquire() }
             worker = Thread { loop() }.also { it.start() }
         }
         return START_STICKY
@@ -89,8 +79,6 @@ class MonitorService : Service() {
         Bus.running = false
         worker?.interrupt()
         wake?.let { if (it.isHeld) it.release() }
-        tts?.stop()
-        tts?.shutdown()
         Bus.post("Зупинено")
         super.onDestroy()
     }
@@ -100,7 +88,7 @@ class MonitorService : Service() {
         nm.createNotificationChannel(NotificationChannel("mon", "Моніторинг", NotificationManager.IMPORTANCE_LOW))
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, "mon")
-            .setContentTitle("Небо Сумщини")
+            .setContentTitle("Монітор")
             .setContentText("Моніторинг активний")
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
             .setContentIntent(pi)
@@ -181,9 +169,7 @@ class MonitorService : Service() {
 
     private fun summary(results: Map<String, List<Msg>>, errors: List<String>, head: String): String {
         val sb = StringBuilder(head)
-        if (!ttsReady && prefs().getBoolean("tts", true)) {
-            sb.append("\n⚠ Немає українського голосу для озвучення тексту")
-        }
+        ttsErr?.let { sb.append("\n⚠ Озвучення: ").append(it) }
         for (e in errors) sb.append("\n⚠ ").append(e)
         for ((n, msgs) in results) {
             sb.append("\n\n@").append(n)
@@ -199,7 +185,7 @@ class MonitorService : Service() {
     private fun handle(m: Msg) {
         val audio = m.audio
         if (audio != null) {
-            play(audio)
+            withFocus { playNow(audio) }
             return
         }
         if (!prefs().getBoolean("tts", true)) return
@@ -223,49 +209,96 @@ class MonitorService : Service() {
         }
     }
 
-    private fun volume(): Float = prefs().getInt("volume", 100) / 100f
-
-    private fun play(url: String) {
-        withFocus {
-            val latch = CountDownLatch(1)
-            val mp = MediaPlayer()
-            try {
-                mp.setAudioAttributes(attrs)
-                mp.setDataSource(url)
-                val v = volume()
-                mp.setVolume(v, v)
-                mp.setOnPreparedListener { it.start() }
-                mp.setOnCompletionListener { latch.countDown() }
-                mp.setOnErrorListener { _, _, _ ->
-                    latch.countDown()
-                    true
-                }
-                mp.prepareAsync()
-                latch.await(120, TimeUnit.SECONDS)
-            } finally {
-                mp.release()
+    private fun playNow(source: String) {
+        val latch = CountDownLatch(1)
+        val mp = MediaPlayer()
+        try {
+            mp.setAudioAttributes(attrs)
+            mp.setDataSource(source)
+            val v = prefs().getInt("volume", 100) / 100f
+            mp.setVolume(v, v)
+            mp.setOnPreparedListener { it.start() }
+            mp.setOnCompletionListener { latch.countDown() }
+            mp.setOnErrorListener { _, _, _ ->
+                latch.countDown()
+                true
             }
+            mp.prepareAsync()
+            latch.await(120, TimeUnit.SECONDS)
+        } finally {
+            mp.release()
         }
     }
 
     private fun speak(text: String) {
-        val t = tts ?: return
-        if (!ttsReady) return
-        withFocus {
-            val latch = CountDownLatch(1)
-            t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) {
-                    latch.countDown()
+        try {
+            withFocus {
+                for (chunk in chunks(text)) {
+                    val f = File(cacheDir, "tts_" + System.nanoTime() + ".mp3")
+                    try {
+                        download(chunk, f)
+                        playNow(f.absolutePath)
+                    } finally {
+                        f.delete()
+                    }
                 }
-                override fun onError(utteranceId: String?) {
-                    latch.countDown()
-                }
-            })
-            val params = Bundle()
-            params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume())
-            t.speak(text, TextToSpeech.QUEUE_FLUSH, params, "u" + System.nanoTime())
-            latch.await(90, TimeUnit.SECONDS)
+            }
+            ttsErr = null
+        } catch (e: InterruptedException) {
+            throw e
+        } catch (e: Exception) {
+            ttsErr = e.message ?: e.javaClass.simpleName
         }
+    }
+
+    private fun download(text: String, out: File) {
+        val u = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=uk&q=" +
+            URLEncoder.encode(text, "UTF-8")
+        val c = URL(u).openConnection() as HttpURLConnection
+        c.connectTimeout = 8000
+        c.readTimeout = 15000
+        c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
+        c.setRequestProperty("Referer", "https://translate.google.com/")
+        try {
+            if (c.responseCode != 200) throw RuntimeException("HTTP ${c.responseCode}")
+            c.inputStream.use { i -> out.outputStream().use { o -> i.copyTo(o) } }
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    private fun chunks(text: String): List<String> {
+        val out = ArrayList<String>()
+        var cur = ""
+        for (sentence in text.split(sentenceRe)) {
+            for (piece in pieces(sentence)) {
+                if (cur.isEmpty()) {
+                    cur = piece
+                } else if (cur.length + 1 + piece.length <= 180) {
+                    cur = "$cur $piece"
+                } else {
+                    out.add(cur)
+                    cur = piece
+                }
+            }
+        }
+        if (cur.isNotEmpty()) out.add(cur)
+        return out
+    }
+
+    private fun pieces(s: String): List<String> {
+        if (s.length <= 180) return listOf(s)
+        val out = ArrayList<String>()
+        var cur = ""
+        for (w in s.split(" ")) {
+            if (cur.isNotEmpty() && cur.length + 1 + w.length > 180) {
+                out.add(cur)
+                cur = w
+            } else {
+                cur = if (cur.isEmpty()) w else "$cur $w"
+            }
+        }
+        if (cur.isNotEmpty()) out.add(cur)
+        return out
     }
 }
