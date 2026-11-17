@@ -157,16 +157,14 @@ object Sherpa {
                 conn.inputStream.use { i ->
                     FileOutputStream(tmp).use { o ->
                         val buf = ByteArray(64 * 1024)
-                        var done = 0L
                         var last = 0L
                         while (true) {
                             if (Thread.interrupted()) throw InterruptedException()
                             val n = i.read(buf)
                             if (n < 0) break
                             o.write(buf, 0, n)
-                            done += n
                             if (total > 0) {
-                                val p = done * 100 / total
+                                val p = o.channel.position() * 100 / total
                                 if (p != last) {
                                     last = p
                                     set("Завантаження моделі $p%…")
@@ -175,10 +173,10 @@ object Sherpa {
                         }
                     }
                 }
-                // архів має бути докачаний до кінця
-                if (total > 0 && done != total) {
+                // архів має бути докачаний до кінця (розмір файла vs Content-Length)
+                if (total > 0 && tmp.length() != total) {
                     throw RuntimeException(
-                        "архів докачався не повністю ($done з $total байтів)"
+                        "архів докачався не повністю (${tmp.length()} з $total байтів)"
                     )
                 }
             } finally {
