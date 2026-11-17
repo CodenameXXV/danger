@@ -15,9 +15,6 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -42,6 +39,7 @@ class MonitorService : Service() {
 
     @Volatile private var active = false
     @Volatile private var ttsErr: String? = null
+    @Volatile private var geminiPause = 0L
     private var worker: Thread? = null
     private var wake: PowerManager.WakeLock? = null
 
@@ -182,17 +180,28 @@ class MonitorService : Service() {
         return sb.toString()
     }
 
+    private fun inCall(): Boolean {
+        if (!prefs().getBoolean("mutecall", true)) return false
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        return when (am.mode) {
+            AudioManager.MODE_IN_CALL,
+            AudioManager.MODE_IN_COMMUNICATION,
+            AudioManager.MODE_RINGTONE -> true
+            else -> Build.VERSION.SDK_INT >= 29 && am.mode == AudioManager.MODE_CALL_SCREENING
+        }
+    }
+
     private fun handle(m: Msg) {
+        if (inCall()) return
         val audio = m.audio
         if (audio != null) {
             withFocus { playNow(audio) }
             return
         }
         if (!prefs().getBoolean("tts", true)) return
+        if (m.text.length > prefs().getInt("maxchars", 200)) return
         val clean = m.text.replace(urlRe, " ").replace(emojiRe, "").replace(spaceRe, " ").trim()
         if (clean.isEmpty()) return
-        val words = clean.split(" ").size
-        if (words > prefs().getInt("maxwords", 40)) return
         speak(clean)
     }
 
@@ -224,46 +233,89 @@ class MonitorService : Service() {
                 true
             }
             mp.prepareAsync()
-            latch.await(120, TimeUnit.SECONDS)
+            var waited = 0L
+            while (waited < 120000L && !latch.await(300, TimeUnit.MILLISECONDS)) {
+                waited += 300
+                if (inCall()) break
+            }
         } finally {
             mp.release()
         }
     }
 
+    private fun tryGemini(text: String): File? {
+        if (prefs().getString("gkey", "").orEmpty().isBlank()) {
+            ttsErr = null
+            return null
+        }
+        if (System.currentTimeMillis() < geminiPause) return null
+        val f = File(cacheDir, "tts_" + System.nanoTime() + ".wav")
+        try {
+            Voice.gemini(this, text, f)
+            ttsErr = null
+            return f
+        } catch (e: InterruptedException) {
+            f.delete()
+            throw e
+        } catch (e: Exception) {
+            f.delete()
+            val m = e.message ?: e.javaClass.simpleName
+            if (m.contains("429")) geminiPause = System.currentTimeMillis() + 60000
+            ttsErr = "Gemini: $m (використано запасний голос)"
+            return null
+        }
+    }
+
+    private fun trySystem(text: String): File? {
+        val f = File(cacheDir, "tts_" + System.nanoTime() + ".wav")
+        try {
+            Voice.system(this, text, f)
+            ttsErr = null
+            return f
+        } catch (e: InterruptedException) {
+            f.delete()
+            throw e
+        } catch (e: Exception) {
+            f.delete()
+            ttsErr = "Вбудований голос: ${e.message ?: e.javaClass.simpleName} (використано запасний голос)"
+            return null
+        }
+    }
+
     private fun speak(text: String) {
         try {
-            withFocus {
-                for (chunk in chunks(text)) {
-                    val f = File(cacheDir, "tts_" + System.nanoTime() + ".mp3")
-                    try {
-                        download(chunk, f)
-                        playNow(f.absolutePath)
-                    } finally {
-                        f.delete()
+            val g = when (Voice.engine(this)) {
+                Voice.ENGINE_SYSTEM -> trySystem(text)
+                Voice.ENGINE_GOOGLE -> {
+                    ttsErr = null
+                    null
+                }
+                else -> tryGemini(text)
+            }
+            if (g != null) {
+                try {
+                    withFocus { playNow(g.absolutePath) }
+                } finally {
+                    g.delete()
+                }
+            } else {
+                withFocus {
+                    for (chunk in chunks(text)) {
+                        if (inCall()) break
+                        val f = File(cacheDir, "tts_" + System.nanoTime() + ".mp3")
+                        try {
+                            Voice.translate(chunk, f)
+                            playNow(f.absolutePath)
+                        } finally {
+                            f.delete()
+                        }
                     }
                 }
             }
-            ttsErr = null
         } catch (e: InterruptedException) {
             throw e
         } catch (e: Exception) {
             ttsErr = e.message ?: e.javaClass.simpleName
-        }
-    }
-
-    private fun download(text: String, out: File) {
-        val u = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=uk&q=" +
-            URLEncoder.encode(text, "UTF-8")
-        val c = URL(u).openConnection() as HttpURLConnection
-        c.connectTimeout = 8000
-        c.readTimeout = 15000
-        c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
-        c.setRequestProperty("Referer", "https://translate.google.com/")
-        try {
-            if (c.responseCode != 200) throw RuntimeException("HTTP ${c.responseCode}")
-            c.inputStream.use { i -> out.outputStream().use { o -> i.copyTo(o) } }
-        } finally {
-            c.disconnect()
         }
     }
 
