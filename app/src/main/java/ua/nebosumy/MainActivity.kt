@@ -557,7 +557,7 @@ class MainActivity : Activity() {
             Voice.ENGINE_SYSTEM to "Голос із налаштувань телефону (Google TTS, Samsung тощо). Потрібна встановлена українська мова. Якщо її немає, використовується голос Google Translate.",
             Voice.ENGINE_GOOGLE to "Безкоштовний голос Google Translate. Ключ не потрібен.",
             Voice.ENGINE_GEMINI to "Найприродніший голос. Потрібен ключ Gemini API. Без ключа або при вичерпанні ліміту використовується голос Google Translate.",
-            Voice.ENGINE_SHERPA to "Повністю офлайн-синтез українською (Piper VITS, голос Lada). Модель ~25 МБ докачується один раз при першому використанні, далі працює без інтернету."
+            Voice.ENGINE_SHERPA to "Повністю офлайн-синтез українською (Supertonic 3, чоловічий голос M1). Модель ~123 МБ докачується один раз при першому використанні, далі працює без інтернету."
         )
         val cur = Voice.engine(this)
         val group = RadioGroup(this)
